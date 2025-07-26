@@ -151,7 +151,8 @@ def personalizar_mensaje(mensaje, asunto, empresa):
     
     return asunto_personalizado, mensaje_personalizado
 
-def enviar_recordatorio(service, destinatarios, asunto, mensaje, thread_id=None, message_id=None, archivo_adjunto=None, nombre_archivo=None): 
+def enviar_recordatorio(service, destinatarios, asunto, mensaje, thread_id=None, message_id=None, archivo_adjunto=None, nombre_archivo=None):
+    """Envía un correo como respuesta a un hilo existente."""
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
     from email.mime.application import MIMEApplication
@@ -170,7 +171,6 @@ def enviar_recordatorio(service, destinatarios, asunto, mensaje, thread_id=None,
     if message_id:
         mime_mensaje["In-Reply-To"] = message_id
         mime_mensaje["References"] = message_id
-        print("Holaaa: ", message_id)
 
     mime_mensaje.attach(MIMEText(mensaje, "html"))
 
@@ -183,16 +183,25 @@ def enviar_recordatorio(service, destinatarios, asunto, mensaje, thread_id=None,
 
     # Codificar el mensaje en base64
     raw_message = base64.urlsafe_b64encode(mime_mensaje.as_bytes()).decode("utf-8")
-    message = {"raw": raw_message}
     
+    # Crear cuerpo del mensaje para la API de Gmail
+    message_body = {"raw": raw_message}
+    if thread_id:
+        message_body["threadId"] = thread_id
+
     try:
-        sent_message = service.users().messages().send(userId="me", body=message, threadId=thread_id).execute()
+        sent_message = service.users().messages().send(
+            userId="me",
+            body=message_body
+        ).execute()
+
         new_message_id = sent_message['id']
         
         # Guardar ID del nuevo mensaje para seguimiento
         for destinatario in lista_destinatarios:
             guardar_IDCorreo(destinatario, new_message_id)
             modificar_ultimo_envio(destinatario)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al enviar recordatorio a {destinatarios_final}: {e}")
 
@@ -425,34 +434,35 @@ async def enviar_correos_personalizados(request: EmailRequest):
                     asunto_personalizado, mensaje_personalizado = personalizar_mensaje(request.mensaje, request.asunto, nombre)
 
                     if es_recordatorio and data["message_ids"]:
-                        # Obtener message_id del mensaje original
-                        original_internal_id = list(data["message_ids"])[0]
+                        try:
+                            # Obtener el ID interno del mensaje original
+                            original_internal_id = list(data["message_ids"])[0]
 
-                        # Obtener threadId (correcto)
-                        original_message = service.users().messages().get(userId="me", id=original_internal_id, format="metadata").execute()
-                        original_thread_id = original_message.get("threadId")
+                            # Obtener el threadId del mensaje original
+                            original_message = service.users().messages().get(userId="me", id=original_internal_id, format="metadata").execute()
+                            original_thread_id = original_message.get("threadId")
 
-                        # Obtener Message-ID real del header
-                        original_message_id_header = obtener_message_id_header(service, original_internal_id)
+                            # Obtener el Message-ID real del header para el In-Reply-To
+                            original_message_id_header = obtener_message_id_header(service, original_internal_id)
 
-                        # Asunto
-                        original_asunto = obtener_asunto_original(service, original_internal_id)
-                        asunto_reply = f"Re: {original_asunto}" if original_asunto else asunto_personalizado
+                            # Crear el asunto para la respuesta
+                            original_asunto = obtener_asunto_original(service, original_internal_id)
+                            asunto_reply = f"Re: {original_asunto}" if original_asunto else asunto_personalizado
 
-                        # Debug
-                        print("internal ID:", original_internal_id)
-                        print("Message-ID header:", original_message_id_header)
-                        print("Thread ID:", original_thread_id)
-
-                        # Enviar reply
-                        enviar_recordatorio(
-                            service=service,
-                            destinatarios=destinatarios,
-                            asunto=asunto_reply,
-                            mensaje=mensaje_personalizado,
-                            thread_id=original_thread_id,
-                            message_id=original_message_id_header
-                        )
+                            # Enviar el recordatorio como una respuesta en el hilo
+                            enviar_recordatorio(
+                                service=service,
+                                destinatarios=destinatarios,
+                                asunto=asunto_reply,
+                                mensaje=mensaje_personalizado,
+                                thread_id=original_thread_id,  # Usar el threadId para mantener el hilo
+                                message_id=original_message_id_header  # Usar el Message-ID para la referencia
+                            )
+                        except Exception as e:
+                            # Si falla la obtención de datos del correo original, enviar como correo nuevo
+                            enviar_correo(service, destinatarios, asunto_personalizado, mensaje_personalizado)
+                            for correo in data["correos"]:
+                                modificar_ultimo_envio(correo)
                     else:
                         # Envío normal
                         enviar_correo(service, destinatarios, asunto_personalizado, mensaje_personalizado)
@@ -556,17 +566,44 @@ async def enviar_correos_con_adjunto(
                     asunto_personalizado, mensaje_personalizado = personalizar_mensaje(mensaje, asunto, nombre)
 
                     if es_recordatorio and data["message_ids"]:
-                        # Para recordatorios con adjunto
-                        thread_id = list(data["message_ids"])[0]
-                        message_id = enviar_recordatorio(
-                            service,
-                            destinatarios,
-                            asunto_personalizado,
-                            mensaje_personalizado,
-                            thread_id,
-                            contenido_adjunto,
-                            archivo.filename
-                        )
+                        try:
+                            # Obtener el ID interno del mensaje original
+                            original_internal_id = list(data["message_ids"])[0]
+
+                            # Obtener el threadId del mensaje original
+                            original_message = service.users().messages().get(userId="me", id=original_internal_id, format="metadata").execute()
+                            original_thread_id = original_message.get("threadId")
+
+                            # Obtener el Message-ID real del header para el In-Reply-To
+                            original_message_id_header = obtener_message_id_header(service, original_internal_id)
+
+                            # Crear el asunto para la respuesta
+                            original_asunto = obtener_asunto_original(service, original_internal_id)
+                            asunto_reply = f"Re: {original_asunto}" if original_asunto else asunto_personalizado
+
+                            # Enviar el recordatorio como una respuesta en el hilo
+                            enviar_recordatorio(
+                                service=service,
+                                destinatarios=destinatarios,
+                                asunto=asunto_reply,
+                                mensaje=mensaje_personalizado,
+                                thread_id=original_thread_id,
+                                message_id=original_message_id_header,
+                                archivo_adjunto=contenido_adjunto,
+                                nombre_archivo=archivo.filename
+                            )
+                        except Exception as e:
+                            # Si falla, enviar como correo nuevo con adjunto
+                            enviar_correo_con_adjunto(
+                                service,
+                                destinatarios,
+                                asunto_personalizado,
+                                mensaje_personalizado,
+                                contenido_adjunto,
+                                archivo.filename
+                            )
+                            for correo in data["correos"]:
+                                modificar_ultimo_envio(correo)
                     else:
                         # Envío normal con adjunto
                         message_id = enviar_correo_con_adjunto(
