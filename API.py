@@ -33,7 +33,7 @@ app = FastAPI()
 
 # Cliente de OpenAI
 client = OpenAI(
-    api_key="",
+    api_key="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",
     base_url="https://openrouter.ai/api/v1"
 )
 
@@ -47,14 +47,13 @@ def conectar_db():
     try:
         conexion = psycopg2.connect(
             user="postgres",
-            password="MecheAC09",
+            password="password",
             host="localhost",
             port="5432",
             dbname="revistaPostgre",
         )
         return conexion
     except Exception as e:
-        # Si ya es un HTTPException, lo re‑lanzamos sin envolver
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(status_code=500,
@@ -79,18 +78,11 @@ def obtener_credenciales():
 
 #limpieza
 def limpiar_correo(correo: str) -> str | None:
-    """
-    Limpia el correo:
-    - Elimina espacios
-    - Reemplaza tildes (ej: josé → jose)
-    - Valida el formato
-    """
-    correo = correo.strip()  # quita espacios
-    correo = unidecode.unidecode(correo)  # elimina tildes
-    # Validar formato simple de email
+    correo = correo.strip()
+    correo = unidecode.unidecode(correo)
     if re.match(r"^[^@]+@[^@]+\.[^@]+$", correo):
         return correo
-    return None  # no válido
+    return None
 
 #Corregir los mail
 def convertir_a_punycode(email):
@@ -128,12 +120,26 @@ def guardar_IDCorreo(email, message_id):
     cursor = conexion.cursor()
     cursor.execute("UPDATE clientes SET message_id = %s WHERE mail = %s;", (message_id, email))
     conexion.commit()
+    cursor.close()
+    conexion.close()
 
 def modificar_ultimo_envio(mail):
     conexion = conectar_db()
     cursor = conexion.cursor()
     cursor.execute("UPDATE clientes SET ultimo_envio = NOW() WHERE mail =%s;", (mail,))
     conexion.commit()
+    cursor.close()
+    conexion.close()
+
+def obtener_message_ids_por_empresa(nombre_empresa):
+    """Obtiene todos los message_ids de los correos de una empresa"""
+    conexion = conectar_db()
+    cursor = conexion.cursor()
+    cursor.execute("SELECT DISTINCT message_id FROM clientes WHERE nombre = %s AND message_id IS NOT NULL;", (nombre_empresa,))
+    message_ids = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    conexion.close()
+    return message_ids
 
 # Función para reemplazar términos clave
 def personalizar_mensaje(mensaje, asunto, empresa):
@@ -145,52 +151,58 @@ def personalizar_mensaje(mensaje, asunto, empresa):
     
     return asunto_personalizado, mensaje_personalizado
 
-def enviar_recordatorio(service, destinatarios, mensaje_id, mensaje, archivo_adjunto=None, nombre_archivo=None):
-    destinatarios_limpios = [convertir_a_punycode(d.strip()) for d in destinatarios.split(',') if d.strip()]
+def enviar_recordatorio(service, destinatarios, asunto, mensaje, thread_id=None, message_id=None, archivo_adjunto=None, nombre_archivo=None): 
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    import base64
 
-    mensaje_original = service.users().messages().get(userId='me', id=mensaje_id, format='metadata').execute()
-    headers = mensaje_original.get("payload", {}).get("headers", [])
-
-    def obtener_header(headers, clave):
-        return next((h["value"] for h in headers if h["name"].lower() == clave.lower()), None)
-
-    asunto = obtener_header(headers, "subject") or "(sin asunto)"
-    referencia = obtener_header(headers, "Message-Id")
-    remitente = "pinguinolalo00@gmail.com"
+    # Convertir destinatarios a punycode si es necesario
+    lista_destinatarios = [convertir_a_punycode(d.strip()) for d in destinatarios.split(",") if d.strip()]
+    destinatarios_final = ", ".join(lista_destinatarios)
 
     mime_mensaje = MIMEMultipart()
-    mime_mensaje["to"] = remitente  # Enviar a nosotros mismos
-    mime_mensaje["bcc"] = ", ".join(destinatarios_limpios)
-    mime_mensaje["from"] = remitente
-    mime_mensaje["subject"] = "Re: " + asunto
-    mime_mensaje["In-Reply-To"] = referencia
-    mime_mensaje["References"] = referencia
+    mime_mensaje["to"] = destinatarios_final
+    mime_mensaje["subject"] = asunto
+    mime_mensaje["from"] = "pinguinolalo00@gmail.com"
+
+    # Encabezados para que se vea como reply
+    if message_id:
+        mime_mensaje["In-Reply-To"] = message_id
+        mime_mensaje["References"] = message_id
+        print("Holaaa: ", message_id)
+
     mime_mensaje.attach(MIMEText(mensaje, "html"))
 
+    # Adjuntar archivo si se proporciona
     if isinstance(archivo_adjunto, bytes):
         filename = nombre_archivo if nombre_archivo else "documento.pdf"
         part = MIMEApplication(archivo_adjunto, Name=filename)
         part.add_header("Content-Disposition", f"attachment; filename={filename}")
         mime_mensaje.attach(part)
 
+    # Codificar el mensaje en base64
     raw_message = base64.urlsafe_b64encode(mime_mensaje.as_bytes()).decode("utf-8")
-    message = {
-        "raw": raw_message,
-        "threadId": mensaje_original.get('threadId')
-    }
-
+    message = {"raw": raw_message}
+    
     try:
-        service.users().messages().send(userId="me", body=message).execute()
+        sent_message = service.users().messages().send(userId="me", body=message, threadId=thread_id).execute()
+        new_message_id = sent_message['id']
+        
+        # Guardar ID del nuevo mensaje para seguimiento
+        for destinatario in lista_destinatarios:
+            guardar_IDCorreo(destinatario, new_message_id)
+            modificar_ultimo_envio(destinatario)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al enviar correo a {destinatarios}: {e}")
-
+        raise HTTPException(status_code=500, detail=f"Error al enviar recordatorio a {destinatarios_final}: {e}")
 
 def enviar_correo(service, destinatarios, asunto, mensaje, archivo_adjunto=None, nombre_archivo=None):
-    destinatarios_limpios = [convertir_a_punycode(d.strip()) for d in destinatarios.split(',') if d.strip()]
+    # Separar múltiples destinatarios (ya separados por coma) y convertir cada uno
+    lista_destinatarios = [convertir_a_punycode(d.strip()) for d in destinatarios.split(",") if d.strip()]
+    destinatarios_final = ", ".join(lista_destinatarios)
 
     mime_mensaje = MIMEMultipart()
-    mime_mensaje["to"] = "pinguinolalo00@gmail.com" # Enviar a nosotros mismos
-    mime_mensaje["bcc"] = ", ".join(destinatarios_limpios)
+    mime_mensaje["to"] = destinatarios_final
     mime_mensaje["subject"] = asunto
     mime_mensaje["from"] = "pinguinolalo00@gmail.com"
     
@@ -208,58 +220,130 @@ def enviar_correo(service, destinatarios, asunto, mensaje, archivo_adjunto=None,
     try:
         sent_message = service.users().messages().send(userId="me", body=message).execute()
         message_id = sent_message['id']
-        for email in destinatarios_limpios:
-            guardar_IDCorreo(email, message_id)
+        # Guardar el ID para cada destinatario individual
+        for destinatario in lista_destinatarios:
+            guardar_IDCorreo(destinatario, message_id)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al enviar correo a {destinatarios}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error al enviar correo a {destinatarios_final}: {e}")
+    
+def obtener_asunto_original(service, message_id):
+    try:
+        mensaje = service.users().messages().get(userId="me", id=message_id, format="metadata").execute()
+        headers = mensaje["payload"]["headers"]
+        for header in headers:
+            if header["name"].lower() == "subject":
+                return header["value"]
+        return None  # No se encontró asunto
+    except Exception as e:
+        print(f"Error al obtener asunto: {e}")
+        return None
 
-
+# FUNCIÓN FALTANTE: enviar_correo_con_adjunto
+def enviar_correo_con_adjunto(service, destinatarios, asunto, mensaje, archivo_adjunto, nombre_archivo):
+    return enviar_correo(service, destinatarios, asunto, mensaje, archivo_adjunto, nombre_archivo)
 
 def get_tipo_correo(tipo, tipo_envio):
-    base_query = """
-        FROM clientes cli
-        JOIN cliente_detalle cd ON cli.id = cd.clienteid
-    """
-    group_by = " GROUP BY cli.nombre"
-
     if tipo == "Sub-Recordatorio":
-        query = """
-        SELECT cli.nombre, STRING_AGG(cli.mail, ',') as mails, cli.message_id
-        """ + base_query + """
-        WHERE cd.subcategoriaid = %s AND cli.estado = TRUE
-        """ + group_by
+        if tipo_envio == "Personalizado":
+            query = """
+            SELECT DISTINCT cli.nombre, cli.mail, cli.message_id, cli.ultimo_envio
+            FROM clientes cli
+            JOIN cliente_detalle cd ON cli.id = cd.clienteid
+            WHERE cd.subcategoriaid = %s AND cli.estado = TRUE AND cli.message_id IS NOT NULL
+            AND (cli.ultimo_envio IS NULL OR cli.ultimo_envio < NOW() - INTERVAL '3 days')
+            ORDER BY cli.ultimo_envio ASC
+            """
+        else:
+            query = """
+            SELECT DISTINCT cli.nombre, cli.mail, cli.message_id
+            FROM clientes cli
+            JOIN cliente_detalle cd ON cli.id = cd.clienteid
+            WHERE cd.subcategoriaid = %s AND cli.estado = TRUE AND cli.message_id IS NOT NULL
+            """
+    
     elif tipo == "Sub-Normal":
-        query = """
-        SELECT cli.nombre, STRING_AGG(cli.mail, ',') as mails
-        """ + base_query + """
-        WHERE cd.subcategoriaid = %s
-        """ + group_by
+        if tipo_envio == "Personalizado":
+            query = """
+            SELECT DISTINCT cli.nombre, cli.mail, cli.ultimo_envio
+            FROM clientes cli
+            JOIN cliente_detalle cd ON cli.id = cd.clienteid
+            WHERE cd.subcategoriaid = %s
+            AND (cli.ultimo_envio IS NULL OR cli.ultimo_envio < NOW() - INTERVAL '3 days')
+            ORDER BY cli.ultimo_envio ASC
+            """
+        else:
+            query = """
+            SELECT DISTINCT cli.nombre, cli.mail
+            FROM clientes cli
+            JOIN cliente_detalle cd ON cli.id = cd.clienteid
+            WHERE cd.subcategoriaid = %s
+            """
+    
     elif tipo == "Cat-Recordatorio":
-        query = """
-        SELECT cli.nombre, STRING_AGG(cli.mail, ',') as mails, cli.message_id
-        """ + base_query + """
-        JOIN subcategorias sub ON cd.subcategoriaid = sub.id
-        JOIN categorias cat ON sub.categoriaid = cat.id
-        WHERE cat.id = %s AND cli.estado = TRUE
-        """ + group_by
+        if tipo_envio == "Personalizado":
+            query = """
+            SELECT DISTINCT cli.nombre, cli.mail, cli.message_id, cli.ultimo_envio
+            FROM clientes cli
+            JOIN cliente_detalle cd ON cli.id = cd.clienteid
+            JOIN subcategorias sub ON cd.subcategoriaid = sub.id
+            JOIN categorias cat ON sub.categoriaid = cat.id
+            WHERE cat.id = %s AND cli.estado = TRUE AND cli.message_id IS NOT NULL
+            AND (cli.ultimo_envio IS NULL OR cli.ultimo_envio < NOW() - INTERVAL '3 days')
+            ORDER BY cli.ultimo_envio ASC
+            """
+        else:
+            query = """
+            SELECT DISTINCT cli.nombre, cli.mail, cli.message_id
+            FROM clientes cli
+            JOIN cliente_detalle cd ON cli.id = cd.clienteid
+            JOIN subcategorias sub ON cd.subcategoriaid = sub.id
+            JOIN categorias cat ON sub.categoriaid = cat.id
+            WHERE cat.id = %s AND cli.estado = TRUE AND cli.message_id IS NOT NULL
+            """
+    
     elif tipo == "Cat-Normal":
-        query = """
-        SELECT cli.nombre, STRING_AGG(cli.mail, ',') as mails
-        """ + base_query + """
-        JOIN subcategorias sub ON cd.subcategoriaid = sub.id
-        JOIN categorias cat ON sub.categoriaid = cat.id
-        WHERE cat.id = %s
-        """ + group_by
+        if tipo_envio == "Personalizado":
+            query = """
+            SELECT DISTINCT cli.nombre, cli.mail, cli.ultimo_envio
+            FROM clientes cli
+            JOIN cliente_detalle cd ON cli.id = cd.clienteid
+            JOIN subcategorias sub ON cd.subcategoriaid = sub.id
+            JOIN categorias cat ON sub.categoriaid = cat.id
+            WHERE cat.id = %s
+            AND (cli.ultimo_envio IS NULL OR cli.ultimo_envio < NOW() - INTERVAL '3 days')
+            ORDER BY cli.ultimo_envio ASC
+            """
+        else:
+            query = """
+            SELECT DISTINCT cli.nombre, cli.mail
+            FROM clientes cli
+            JOIN cliente_detalle cd ON cli.id = cd.clienteid
+            JOIN subcategorias sub ON cd.subcategoriaid = sub.id
+            JOIN categorias cat ON sub.categoriaid = cat.id
+            WHERE cat.id = %s
+            """
+    
     else:
         query = None
-
-    if query and tipo_envio == "Personalizado":
-        # La cláusula ORDER BY no es compatible con GROUP BY de esta manera.
-        # Se puede ajustar si es necesario, pero por ahora se omite.
-        pass
-
     return query
 
+def obtener_message_id_header(service, internal_message_id):
+    try:
+        mensaje = service.users().messages().get(
+            userId="me",
+            id=internal_message_id,
+            format="metadata",
+            metadataHeaders=["Message-ID"]
+        ).execute()
+
+        headers = mensaje["payload"]["headers"]
+        for header in headers:
+            if header["name"].lower() == "message-id":
+                return header["value"]  # ← Este es el que necesitas
+        return None
+    except Exception as e:
+        print(f"Error al obtener Message-ID: {e}")
+        return None
 
 # Endpoint para procesar el prompt con la IA
 @app.post("/generar-contenido/")
@@ -274,7 +358,6 @@ async def generar_contenido(request: PromptRequest):
 @app.post("/enviar-correos-personalizados/")
 async def enviar_correos_personalizados(request: EmailRequest):
     import asyncio
-
     BATCH_SIZE = 30
     TIEMPO_ENTRE_LOTES = 10
     TIEMPO_ENTRE_CORREOS = 10
@@ -298,41 +381,92 @@ async def enviar_correos_personalizados(request: EmailRequest):
         if not clientes:
             return {"mensaje": "No se encontraron clientes", "fallidos": []}
 
+        # Determinar si es recordatorio
+        es_recordatorio = "Recordatorio" in tipo
+
+        # Agrupar por empresa y juntar todos sus correos (eliminando duplicados)
+        empresas = {}
+        clientes_procesados = set()  # Para evitar duplicados por correo
+        
+        for fila in clientes:
+            nombre = fila[0]
+            correo = fila[1]
+            message_id = fila[2] if len(fila) > 2 else None
+            
+            correo_limpio = limpiar_correo(correo)
+            if not correo_limpio:
+                fallidos.append({"mail": correo, "empresa": nombre, "razon": "Correo inválido"})
+                continue
+            
+            # Crear clave única por correo para evitar duplicados
+            clave_cliente = correo_limpio.lower()
+            if clave_cliente in clientes_procesados:
+                continue  # Saltar si ya procesamos este correo
+            
+            clientes_procesados.add(clave_cliente)
+                
+            if nombre not in empresas:
+                empresas[nombre] = {"correos": set(), "message_ids": set()}
+            
+            empresas[nombre]["correos"].add(correo_limpio)
+            if message_id:
+                empresas[nombre]["message_ids"].add(message_id)
+
         correos_enviados = []
-        max_envios = len(clientes) if request.tipo_envio == "Todos" or request.cantidad > len(clientes) else request.cantidad
-        es_recordatorio = tipo in ("Sub-Recordatorio", "Cat-Recordatorio")
+        empresas_items = list(empresas.items())
+        max_envios = len(empresas_items) if request.tipo_envio == "Todos" or request.cantidad > len(empresas_items) else request.cantidad
 
         for i in range(0, max_envios, BATCH_SIZE):
-            lote = clientes[i:i + BATCH_SIZE]
-            for cliente in lote:
+            lote = empresas_items[i:i + BATCH_SIZE]
+            for nombre, data in lote:
                 try:
-                    if es_recordatorio:
-                        nombre, mails, message_id = cliente
-                    else:
-                        nombre, mails = cliente
-
+                    # Enviar a todos los correos juntos
+                    destinatarios = ", ".join([convertir_a_punycode(c) for c in data["correos"]])
                     asunto_personalizado, mensaje_personalizado = personalizar_mensaje(request.mensaje, request.asunto, nombre)
 
-                    if es_recordatorio:
-                        enviar_recordatorio(service, mails, message_id, mensaje_personalizado)
-                    else:
-                        enviar_correo(service, mails, asunto_personalizado, mensaje_personalizado)
+                    if es_recordatorio and data["message_ids"]:
+                        # Obtener message_id del mensaje original
+                        original_internal_id = list(data["message_ids"])[0]
 
-                    for mail in mails.split(','):
-                        modificar_ultimo_envio(mail)
-                    correos_enviados.append({"destinatario": mails, "empresa": nombre})
+                        # Obtener threadId (correcto)
+                        original_message = service.users().messages().get(userId="me", id=original_internal_id, format="metadata").execute()
+                        original_thread_id = original_message.get("threadId")
+
+                        # Obtener Message-ID real del header
+                        original_message_id_header = obtener_message_id_header(service, original_internal_id)
+
+                        # Asunto
+                        original_asunto = obtener_asunto_original(service, original_internal_id)
+                        asunto_reply = f"Re: {original_asunto}" if original_asunto else asunto_personalizado
+
+                        # Debug
+                        print("internal ID:", original_internal_id)
+                        print("Message-ID header:", original_message_id_header)
+                        print("Thread ID:", original_thread_id)
+
+                        # Enviar reply
+                        enviar_recordatorio(
+                            service=service,
+                            destinatarios=destinatarios,
+                            asunto=asunto_reply,
+                            mensaje=mensaje_personalizado,
+                            thread_id=original_thread_id,
+                            message_id=original_message_id_header
+                        )
+                    else:
+                        # Envío normal
+                        enviar_correo(service, destinatarios, asunto_personalizado, mensaje_personalizado)
+                        
+                        # Solo actualizar ultimo_envio para correos normales
+                        for correo in data["correos"]:
+                            modificar_ultimo_envio(correo)
+
+                    correos_enviados.append({"empresa": nombre, "destinatarios": destinatarios})
                     await asyncio.sleep(TIEMPO_ENTRE_CORREOS)
 
                 except Exception as e:
                     razon = str(e)
-                    if "Invalid to header" in razon or "Invalid email" in razon:
-                        razon_simplificada = "Correo inválido"
-                    elif "domain not found" in razon:
-                        razon_simplificada = "Dominio no válido"
-                    else:
-                        razon_simplificada = "Error al enviar"
-
-                    fallidos.append({"mail": mails, "empresa": nombre, "razon": razon_simplificada})
+                    fallidos.append({"empresa": nombre, "razon": razon})
 
             await asyncio.sleep(TIEMPO_ENTRE_LOTES)
 
@@ -341,26 +475,24 @@ async def enviar_correos_personalizados(request: EmailRequest):
             "detalle": correos_enviados,
             "fallidos": fallidos
         }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conexion.close()
 
-
-
 # Endpoint para enviar correos con archivo adjunto subido a través de la API
 @app.post("/enviar-correos-con-adjunto/")
 async def enviar_correos_con_adjunto(
-    categoria: str = Form(...),
     tipo: str = Form(...),
-    tipo_envio: str = Form(...),
-    cantidad: int = Form(...),
+    categoria: str = Form(...),
     asunto: str = Form(...),
     mensaje: str = Form(...),
+    tipo_envio: str = Form(...),
+    cantidad: int = Form(...),
     archivo: UploadFile = File(...)
 ):
     import asyncio
-
     BATCH_SIZE = 30
     TIEMPO_ENTRE_LOTES = 10
     TIEMPO_ENTRE_CORREOS = 10
@@ -373,10 +505,7 @@ async def enviar_correos_con_adjunto(
     fallidos = []
 
     try:
-        contenido_archivo = await archivo.read()
-        nombre_archivo = archivo.filename
         query = get_tipo_correo(tipo, tipo_envio)
-
         if query:
             cursor.execute(query, (categoria,))
         clientes = cursor.fetchall()
@@ -384,46 +513,85 @@ async def enviar_correos_con_adjunto(
         if not clientes:
             return {"mensaje": "No se encontraron clientes", "fallidos": []}
 
+        contenido_adjunto = await archivo.read()
+        es_recordatorio = "Recordatorio" in tipo
+
+        # Agrupar correos por empresa (eliminando duplicados)
+        empresas = {}
+        clientes_procesados = set()  # Para evitar duplicados por correo
+        
+        for fila in clientes:
+            nombre = fila[0]
+            correo = fila[1]
+            message_id = fila[2] if len(fila) > 2 else None
+            
+            correo_limpio = limpiar_correo(correo)
+            if not correo_limpio:
+                fallidos.append({"mail": correo, "empresa": nombre, "razon": "Correo inválido"})
+                continue
+            
+            # Crear clave única por correo para evitar duplicados
+            clave_cliente = correo_limpio.lower()
+            if clave_cliente in clientes_procesados:
+                continue  # Saltar si ya procesamos este correo
+            
+            clientes_procesados.add(clave_cliente)
+                
+            if nombre not in empresas:
+                empresas[nombre] = {"correos": set(), "message_ids": set()}
+            
+            empresas[nombre]["correos"].add(correo_limpio)
+            if message_id:
+                empresas[nombre]["message_ids"].add(message_id)
+
         correos_enviados = []
-        max_envios = len(clientes) if tipo_envio == "Todos" or cantidad > len(clientes) else cantidad
-        es_recordatorio = tipo in ("Sub-Recordatorio", "Cat-Recordatorio")
+        empresas_items = list(empresas.items())
+        max_envios = len(empresas_items) if tipo_envio == "Todos" or cantidad > len(empresas_items) else cantidad
 
         for i in range(0, max_envios, BATCH_SIZE):
-            lote = clientes[i:i + BATCH_SIZE]
-            for cliente in lote:
+            lote = empresas_items[i:i + BATCH_SIZE]
+            for nombre, data in lote:
                 try:
-                    if es_recordatorio:
-                        nombre, mails, message_id = cliente
-                    else:
-                        nombre, mails = cliente
-
+                    destinatarios = ", ".join([convertir_a_punycode(c) for c in data["correos"]])
                     asunto_personalizado, mensaje_personalizado = personalizar_mensaje(mensaje, asunto, nombre)
 
-                    if es_recordatorio:
-                        enviar_recordatorio(service, mails, message_id, mensaje_personalizado, contenido_archivo, nombre_archivo)
+                    if es_recordatorio and data["message_ids"]:
+                        # Para recordatorios con adjunto
+                        thread_id = list(data["message_ids"])[0]
+                        message_id = enviar_recordatorio(
+                            service,
+                            destinatarios,
+                            asunto_personalizado,
+                            mensaje_personalizado,
+                            thread_id,
+                            contenido_adjunto,
+                            archivo.filename
+                        )
                     else:
-                        enviar_correo(service, mails, asunto_personalizado, mensaje_personalizado, contenido_archivo, nombre_archivo)
+                        # Envío normal con adjunto
+                        message_id = enviar_correo_con_adjunto(
+                            service,
+                            destinatarios,
+                            asunto_personalizado,
+                            mensaje_personalizado,
+                            contenido_adjunto,
+                            archivo.filename
+                        )
+                        
+                        # Solo actualizar ultimo_envio para correos normales
+                        for correo in data["correos"]:
+                            modificar_ultimo_envio(correo)
 
-                    for mail in mails.split(','):
-                        modificar_ultimo_envio(mail)
-                    correos_enviados.append({"destinatario": mails, "empresa": nombre})
+                    correos_enviados.append({"empresa": nombre, "destinatarios": destinatarios})
                     await asyncio.sleep(TIEMPO_ENTRE_CORREOS)
 
                 except Exception as e:
-                    razon = str(e)
-                    if "Invalid to header" in razon or "Invalid email" in razon:
-                        razon_simplificada = "Correo inválido"
-                    elif "domain not found" in razon:
-                        razon_simplificada = "Dominio no válido"
-                    else:
-                        razon_simplificada = "Error al enviar"
-
-                    fallidos.append({"mail": mails, "empresa": nombre, "razon": razon_simplificada})
+                    fallidos.append({"empresa": nombre, "razon": str(e)})
 
             await asyncio.sleep(TIEMPO_ENTRE_LOTES)
 
         return {
-            "mensaje": f"Se enviaron {len(correos_enviados)} correos exitosamente",
+            "mensaje": f"Se enviaron {len(correos_enviados)} correos con adjunto exitosamente",
             "detalle": correos_enviados,
             "fallidos": fallidos
         }
@@ -432,7 +600,6 @@ async def enviar_correos_con_adjunto(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conexion.close()
-
 
 # Para pruebas
 if __name__ == "__main__":
