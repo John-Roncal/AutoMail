@@ -216,47 +216,46 @@ def enviar_correo(service, destinatarios, asunto, mensaje, archivo_adjunto=None,
 
 
 def get_tipo_correo(tipo, tipo_envio):
-    base_query = """
-        FROM clientes cli
-        JOIN cliente_detalle cd ON cli.id = cd.clienteid
-    """
-    group_by = " GROUP BY cli.nombre"
-
     if tipo == "Sub-Recordatorio":
         query = """
-        SELECT cli.nombre, STRING_AGG(cli.mail, ',') as mails, cli.message_id
-        """ + base_query + """
+        SELECT cli.nombre, cli.mail, cli.message_id
+        FROM clientes cli
+        JOIN cliente_detalle cd ON cli.id = cd.clienteid
         WHERE cd.subcategoriaid = %s AND cli.estado = TRUE
-        """ + group_by
+        """
     elif tipo == "Sub-Normal":
         query = """
-        SELECT cli.nombre, STRING_AGG(cli.mail, ',') as mails
-        """ + base_query + """
+        SELECT cli.nombre, cli.mail
+        FROM clientes cli
+        JOIN cliente_detalle cd ON cli.id = cd.clienteid
         WHERE cd.subcategoriaid = %s
-        """ + group_by
+        """
     elif tipo == "Cat-Recordatorio":
         query = """
-        SELECT cli.nombre, STRING_AGG(cli.mail, ',') as mails, cli.message_id
-        """ + base_query + """
+        SELECT cli.nombre, cli.mail, cli.message_id
+        FROM clientes cli
+        JOIN cliente_detalle cd ON cli.id = cd.clienteid
         JOIN subcategorias sub ON cd.subcategoriaid = sub.id
         JOIN categorias cat ON sub.categoriaid = cat.id
         WHERE cat.id = %s AND cli.estado = TRUE
-        """ + group_by
+        """
     elif tipo == "Cat-Normal":
         query = """
-        SELECT cli.nombre, STRING_AGG(cli.mail, ',') as mails
-        """ + base_query + """
+        SELECT cli.nombre, cli.mail
+        FROM clientes cli
+        JOIN cliente_detalle cd ON cli.id = cd.clienteid
         JOIN subcategorias sub ON cd.subcategoriaid = sub.id
         JOIN categorias cat ON sub.categoriaid = cat.id
         WHERE cat.id = %s
-        """ + group_by
+        """
     else:
         query = None
 
-    if query and tipo_envio == "Personalizado":
-        # La cláusula ORDER BY no es compatible con GROUP BY de esta manera.
-        # Se puede ajustar si es necesario, pero por ahora se omite.
-        pass
+    if tipo_envio == "Personalizado":
+        query += """
+        AND (cli.ultimo_envio IS NULL OR cli.ultimo_envio < NOW() - INTERVAL '7 days')
+        ORDER BY cli.ultimo_envio ASC
+        """
 
     return query
 
@@ -274,6 +273,7 @@ async def generar_contenido(request: PromptRequest):
 @app.post("/enviar-correos-personalizados/")
 async def enviar_correos_personalizados(request: EmailRequest):
     import asyncio
+    from collections import defaultdict
 
     BATCH_SIZE = 30
     TIEMPO_ENTRE_LOTES = 10
@@ -293,34 +293,47 @@ async def enviar_correos_personalizados(request: EmailRequest):
 
         if query:
             cursor.execute(query, (categoria,))
-        clientes = cursor.fetchall()
+        clientes_db = cursor.fetchall()
 
-        if not clientes:
+        if not clientes_db:
             return {"mensaje": "No se encontraron clientes", "fallidos": []}
+
+        es_recordatorio = tipo in ("Sub-Recordatorio", "Cat-Recordatorio")
+
+        # Agrupar clientes
+        clientes_agrupados = defaultdict(lambda: {'mails': [], 'message_id': None})
+        if es_recordatorio:
+            for nombre, mail, message_id in clientes_db:
+                # Usamos el message_id como clave para agrupar
+                clientes_agrupados[(nombre, message_id)]['mails'].append(mail)
+                clientes_agrupados[(nombre, message_id)]['message_id'] = message_id
+        else:
+            for nombre, mail in clientes_db:
+                clientes_agrupados[nombre]['mails'].append(mail)
+
+        clientes = list(clientes_agrupados.items())
 
         correos_enviados = []
         max_envios = len(clientes) if request.tipo_envio == "Todos" or request.cantidad > len(clientes) else request.cantidad
-        es_recordatorio = tipo in ("Sub-Recordatorio", "Cat-Recordatorio")
 
         for i in range(0, max_envios, BATCH_SIZE):
             lote = clientes[i:i + BATCH_SIZE]
-            for cliente in lote:
+            for clave_grupo, datos_grupo in lote:
                 try:
-                    if es_recordatorio:
-                        nombre, mails, message_id = cliente
-                    else:
-                        nombre, mails = cliente
+                    nombre = clave_grupo[0] if isinstance(clave_grupo, tuple) else clave_grupo
+                    mails = datos_grupo['mails']
 
                     asunto_personalizado, mensaje_personalizado = personalizar_mensaje(request.mensaje, request.asunto, nombre)
 
                     if es_recordatorio:
-                        enviar_recordatorio(service, mails, message_id, mensaje_personalizado)
+                        message_id = datos_grupo['message_id']
+                        enviar_recordatorio(service, ",".join(mails), message_id, mensaje_personalizado)
                     else:
-                        enviar_correo(service, mails, asunto_personalizado, mensaje_personalizado)
+                        enviar_correo(service, ",".join(mails), asunto_personalizado, mensaje_personalizado)
 
-                    for mail in mails.split(','):
+                    for mail in mails:
                         modificar_ultimo_envio(mail)
-                    correos_enviados.append({"destinatario": mails, "empresa": nombre})
+                    correos_enviados.append({"destinatario": ",".join(mails), "empresa": nombre})
                     await asyncio.sleep(TIEMPO_ENTRE_CORREOS)
 
                 except Exception as e:
@@ -332,7 +345,7 @@ async def enviar_correos_personalizados(request: EmailRequest):
                     else:
                         razon_simplificada = "Error al enviar"
 
-                    fallidos.append({"mail": mails, "empresa": nombre, "razon": razon_simplificada})
+                    fallidos.append({"mail": ",".join(mails), "empresa": nombre, "razon": razon_simplificada})
 
             await asyncio.sleep(TIEMPO_ENTRE_LOTES)
 
@@ -360,6 +373,7 @@ async def enviar_correos_con_adjunto(
     archivo: UploadFile = File(...)
 ):
     import asyncio
+    from collections import defaultdict
 
     BATCH_SIZE = 30
     TIEMPO_ENTRE_LOTES = 10
@@ -379,34 +393,46 @@ async def enviar_correos_con_adjunto(
 
         if query:
             cursor.execute(query, (categoria,))
-        clientes = cursor.fetchall()
+        clientes_db = cursor.fetchall()
 
-        if not clientes:
+        if not clientes_db:
             return {"mensaje": "No se encontraron clientes", "fallidos": []}
+
+        es_recordatorio = tipo in ("Sub-Recordatorio", "Cat-Recordatorio")
+
+        # Agrupar clientes
+        clientes_agrupados = defaultdict(lambda: {'mails': [], 'message_id': None})
+        if es_recordatorio:
+            for nombre, mail, message_id in clientes_db:
+                clientes_agrupados[(nombre, message_id)]['mails'].append(mail)
+                clientes_agrupados[(nombre, message_id)]['message_id'] = message_id
+        else:
+            for nombre, mail in clientes_db:
+                clientes_agrupados[nombre]['mails'].append(mail)
+
+        clientes = list(clientes_agrupados.items())
 
         correos_enviados = []
         max_envios = len(clientes) if tipo_envio == "Todos" or cantidad > len(clientes) else cantidad
-        es_recordatorio = tipo in ("Sub-Recordatorio", "Cat-Recordatorio")
 
         for i in range(0, max_envios, BATCH_SIZE):
             lote = clientes[i:i + BATCH_SIZE]
-            for cliente in lote:
+            for clave_grupo, datos_grupo in lote:
                 try:
-                    if es_recordatorio:
-                        nombre, mails, message_id = cliente
-                    else:
-                        nombre, mails = cliente
+                    nombre = clave_grupo[0] if isinstance(clave_grupo, tuple) else clave_grupo
+                    mails = datos_grupo['mails']
 
                     asunto_personalizado, mensaje_personalizado = personalizar_mensaje(mensaje, asunto, nombre)
 
                     if es_recordatorio:
-                        enviar_recordatorio(service, mails, message_id, mensaje_personalizado, contenido_archivo, nombre_archivo)
+                        message_id = datos_grupo['message_id']
+                        enviar_recordatorio(service, ",".join(mails), message_id, mensaje_personalizado, contenido_archivo, nombre_archivo)
                     else:
-                        enviar_correo(service, mails, asunto_personalizado, mensaje_personalizado, contenido_archivo, nombre_archivo)
+                        enviar_correo(service, ",".join(mails), asunto_personalizado, mensaje_personalizado, contenido_archivo, nombre_archivo)
 
-                    for mail in mails.split(','):
+                    for mail in mails:
                         modificar_ultimo_envio(mail)
-                    correos_enviados.append({"destinatario": mails, "empresa": nombre})
+                    correos_enviados.append({"destinatario": ",".join(mails), "empresa": nombre})
                     await asyncio.sleep(TIEMPO_ENTRE_CORREOS)
 
                 except Exception as e:
@@ -418,7 +444,7 @@ async def enviar_correos_con_adjunto(
                     else:
                         razon_simplificada = "Error al enviar"
 
-                    fallidos.append({"mail": mails, "empresa": nombre, "razon": razon_simplificada})
+                    fallidos.append({"mail": ",".join(mails), "empresa": nombre, "razon": razon_simplificada})
 
             await asyncio.sleep(TIEMPO_ENTRE_LOTES)
 
